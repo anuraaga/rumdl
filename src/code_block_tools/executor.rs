@@ -5,11 +5,76 @@
 
 use super::config::ToolDefinition;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_os = "wasi"))]
+use std::io::{Read, Write};
+#[cfg(not(target_os = "wasi"))]
+use std::process::{Command, Stdio};
+#[cfg(not(target_os = "wasi"))]
 use std::thread;
+#[cfg(not(target_os = "wasi"))]
 use std::time::{Duration, Instant};
+
+// Because WASI does not include process spawning, we define a custom ABI for it.
+#[cfg(target_os = "wasi")]
+mod host {
+    #[link(wasm_import_module = "rumdl")]
+    unsafe extern "C" {
+        /// Returns non-zero if a tool with the given name is available.
+        pub fn check_tool_exists(name_ptr: *const u8, name_len: usize) -> i32;
+
+        /// Executes a tool, passing `args` (each framed as a u32 LE length
+        /// followed by that many bytes) and `stdin`.
+        ///
+        /// The host writes the captured stdout/stderr into guest memory it
+        /// allocates via [`rumdl_wasm_alloc`], storing the pointer and length
+        /// at the provided out-params. Returns the tool's exit code.
+        #[allow(clippy::too_many_arguments)]
+        pub fn execute_tool(
+            name_ptr: *const u8,
+            name_len: usize,
+            args_ptr: *const u8,
+            args_len: usize,
+            stdin_ptr: *const u8,
+            stdin_len: usize,
+            timeout_ms: u64,
+            out_stdout_ptr: *mut usize,
+            out_stdout_len: *mut usize,
+            out_stderr_ptr: *mut usize,
+            out_stderr_len: *mut usize,
+        ) -> i32;
+    }
+}
+
+/// Allocates `len` bytes in guest linear memory for the host to fill.
+///
+/// Called by the WASI host (not from Rust) to return tool output. The matching
+/// free happens in the guest in [`read_host_string`] after the bytes have been copied out.
+#[cfg(target_os = "wasi")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rumdl_wasm_alloc(len: usize) -> *mut u8 {
+    if len == 0 {
+        return std::ptr::NonNull::<u8>::dangling().as_ptr();
+    }
+    // SAFETY: len > 0, align 1 is always valid for u8.
+    unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align_unchecked(len, 1)) }
+}
+
+/// Copies a host-allocated `[ptr, len)` byte range into an owned String and
+/// frees the allocation made by [`rumdl_wasm_alloc`].
+#[cfg(target_os = "wasi")]
+fn read_host_string(ptr: usize, len: usize) -> String {
+    if ptr == 0 || len == 0 {
+        return String::new();
+    }
+    // SAFETY: the host allocated [ptr, len) via rumdl_wasm_alloc (align 1).
+    unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const u8, len);
+        let s = String::from_utf8_lossy(slice).into_owned();
+        std::alloc::dealloc(ptr as *mut u8, std::alloc::Layout::from_size_align_unchecked(len, 1));
+        s
+    }
+}
 
 /// Result of executing a tool.
 #[derive(Debug, Clone)]
@@ -121,15 +186,20 @@ impl ToolExecutor {
                 .is_ok_and(|s| s.success())
         }
 
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(target_os = "wasi")]
         {
-            // WASM and other platforms: external tools not available
+            !tool_name.is_empty() && unsafe { host::check_tool_exists(tool_name.as_ptr(), tool_name.len()) != 0 }
+        }
+
+        #[cfg(not(any(unix, windows, target_os = "wasi")))]
+        {
+            // Other WASM and platforms without process support: tools unavailable
             let _ = tool_name;
             false
         }
     }
 
-    /// Execute a tool with the given input.
+    /// Execute a tool with the given input by spawning a child process.
     ///
     /// # Arguments
     /// * `tool_def` - Tool definition with command and arguments
@@ -139,6 +209,7 @@ impl ToolExecutor {
     ///
     /// # Returns
     /// Tool output on success, or an error.
+    #[cfg(not(target_os = "wasi"))]
     pub fn execute(
         &self,
         tool_def: &ToolDefinition,
@@ -254,6 +325,87 @@ impl ToolExecutor {
         })
     }
 
+    /// Execute a tool with the given input by delegating to the WASI host.
+    ///
+    /// # Arguments
+    /// * `tool_def` - Tool definition with command and arguments
+    /// * `input` - Content to pass via stdin
+    /// * `is_format_mode` - Whether to use format_args (true) or lint_args (false)
+    /// * `timeout_ms` - Optional timeout override
+    ///
+    /// # Returns
+    /// Tool output on success, or an error.
+    #[cfg(target_os = "wasi")]
+    pub fn execute(
+        &self,
+        tool_def: &ToolDefinition,
+        input: &str,
+        is_format_mode: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<ToolOutput, ExecutorError> {
+        if tool_def.command.is_empty() {
+            return Err(ExecutorError::ExecutionFailed {
+                tool: "unknown".to_string(),
+                message: "Empty command".to_string(),
+            });
+        }
+
+        let tool_name = &tool_def.command[0];
+
+        // Check tool availability (lazy, cached)
+        if !self.is_tool_available(tool_name) {
+            return Err(ExecutorError::ToolNotFound {
+                tool: tool_name.clone(),
+            });
+        }
+
+        let extra_args = if is_format_mode {
+            &tool_def.format_args
+        } else {
+            &tool_def.lint_args
+        };
+        let stdin_input = if tool_def.stdin { input } else { "" };
+        let timeout_ms = timeout_ms.unwrap_or(self.default_timeout_ms);
+
+        // Serialize arguments length-prefixed (u32 LE length + bytes per arg)
+        // so that args containing any byte (including NUL) are unambiguous.
+        let mut args: Vec<u8> = Vec::new();
+        for arg in tool_def.command[1..].iter().chain(extra_args.iter()) {
+            args.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+            args.extend_from_slice(arg.as_bytes());
+        }
+
+        let mut stdout_ptr: usize = 0;
+        let mut stdout_len: usize = 0;
+        let mut stderr_ptr: usize = 0;
+        let mut stderr_len: usize = 0;
+
+        // SAFETY: pointers/lengths reference live buffers for the call's
+        // duration; the host writes output pointers into the out-params.
+        let exit_code = unsafe {
+            host::execute_tool(
+                tool_name.as_ptr(),
+                tool_name.len(),
+                args.as_ptr(),
+                args.len(),
+                stdin_input.as_ptr(),
+                stdin_input.len(),
+                timeout_ms,
+                &mut stdout_ptr,
+                &mut stdout_len,
+                &mut stderr_ptr,
+                &mut stderr_len,
+            )
+        };
+
+        Ok(ToolOutput {
+            stdout: read_host_string(stdout_ptr, stdout_len),
+            stderr: read_host_string(stderr_ptr, stderr_len),
+            exit_code,
+            success: exit_code == 0,
+        })
+    }
+
     /// Execute a tool for formatting (returns formatted content).
     pub fn format(
         &self,
@@ -292,12 +444,14 @@ impl ToolExecutor {
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn read_pipe_to_string<R: Read>(mut pipe: R) -> std::io::Result<String> {
     let mut buf = Vec::new();
     pipe.read_to_end(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn join_reader(handle: Option<thread::JoinHandle<std::io::Result<String>>>) -> Result<String, String> {
     match handle {
         Some(handle) => match handle.join() {
